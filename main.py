@@ -8,8 +8,8 @@ from astrbot.api import llm_tool, logger
 from astrbot.api.event import AstrMessageEvent
 from astrbot.core.message.message_event_result import MessageChain
 
-# Google GenAI SDK
-from google import genai
+# Google GenAI SDK：这里只需要 types（用于组装原生 Google Search 工具调用的请求参数），
+# 不再需要 genai.Client——API Key / Base URL 全部改由 AstrBot 的模型提供商 (Provider) 系统管理。
 from google.genai import types
 
 # HTTP & HTML parsing
@@ -26,17 +26,23 @@ except Exception:  # pragma: no cover
 
 class Main(star.Star):
 	"""
-	使用 Gemini 2.0 Flash + Google Search 原生工具进行联网检索。
-	在函数工具中执行检索与汇总，返回结果文本，框架会把该文本作为 tool 消息注入当前对话，
-	供主 LLM 后续综合使用。
+	使用 AstrBot 已配置好的 Gemini 模型提供商 (Provider) + Google Search 原生工具 (Native Tool) 进行联网检索。
+
+	与旧版本的关键差异：
+	- 不再在插件里手动填写 API Key / Base URL / 模型名称；
+	- 改为在插件设置中选择一个或多个已在 AstrBot『模型服务 (Providers)』页面配置好的
+	  Google GenAI / Gemini 类型 Provider，插件会直接借用该 Provider 内部已经建好的
+	  google-genai 异步客户端 (AsyncClient) 来发起请求，因此仍然可以启用 Gemini 原生的
+	  Google Search 工具（这是走 AstrBot 通用 Provider.text_chat() 抽象层无法做到的，
+	  因为那个抽象层不支持传入厂商专属的原生工具配置）。
+	- 支持配置多个 Provider，按顺序轮询 (Round-robin) 或随机 (Random) 选用，取代旧版“多个 API Key”的负载分摊方式。
 	"""
 
 	def __init__(self, context: star.Context, config=None) -> None:
 		self.context = context
 		# AstrBot 会根据 _conf_schema.json 构造 config（AstrBotConfig），此处按 dict 访问
 		self.config = config or {}
-		self._rr_index = 0  # 轮询下标
-		self._clients: dict[str, genai.Client] = {}
+		self._rr_index = 0  # 轮询下标 (Round-robin index)，用于在多个搜索 Provider 之间轮询
 
 	async def initialize(self):
 		# 默认启用工具
@@ -49,6 +55,17 @@ class Main(star.Star):
 		logger.info("[webshot_analyze] 函数工具已启用")
 		logger.info("[webshot_send] 函数工具已启用")
 
+		providers = self._get_configured_search_providers()
+		if not providers:
+			logger.warning(
+				"[gemini_search] 尚未在插件设置的『search_providers』中配置任何模型提供商 (Provider)。"
+				"请前往插件设置，添加至少一个已在 AstrBot『模型服务 (Providers)』页面配置好的"
+				"Google GenAI / Gemini 类型 Provider；若留空，工具调用时会尝试回退使用当前会话的默认 Provider。"
+			)
+		else:
+			ids = ", ".join(p["provider_id"] for p in providers)
+			logger.info(f"[gemini_search] 已配置 {len(providers)} 个搜索用 Provider: {ids}")
+
 	@llm_tool("gemini_search")
 	async def gemini_search(self, event: AstrMessageEvent, query: str) -> str:
 		"""这是一个“联网搜索”的函数工具（工具名：gemini_search）。当需要获取互联网上的实时/最新信息时，你必须调用本工具进行搜索。
@@ -60,12 +77,10 @@ class Main(star.Star):
 			str: 要点摘要与引用来源，作为 tool 消息注入上下文
 		"""
 		try:
-			client = self._get_client()
+			client, model, provider_id = await self._resolve_provider(event)
 		except Exception as e:
-			logger.error(f"[gemini_search] 初始化客户端失败: {e}")
-			return "请先在插件配置中填写有效的 Gemini API Key。"
-
-		model = self.config.get("model", "gemini-2.0-flash")
+			logger.error(f"[gemini_search] 选取模型提供商 (Provider) 失败: {e}")
+			return str(e)
 
 		# 启用原生 Google Search 工具
 		config = types.GenerateContentConfig(
@@ -91,8 +106,8 @@ class Main(star.Star):
 			text = getattr(resp, "text", None) or self._extract_text(resp)
 			return text.strip() if text else "未从检索中获得可用文本结果。"
 		except Exception as e:
-			logger.error(f"[gemini_search] 调用失败: {e}")
-			return f"检索失败：{e}"
+			logger.error(f"[gemini_search] 调用 Provider「{provider_id}」失败: {e}")
+			return f"检索失败（Provider: {provider_id}）：{e}"
 
 	@llm_tool("web_fetch")
 	async def web_fetch(self, event: AstrMessageEvent, url: str) -> str:
@@ -166,12 +181,12 @@ class Main(star.Star):
 				logger.error(f"[webshot_analyze] 注入截图失败: {e}")
 				return f"注入截图失败：{e}"
 		
-		# 使用插件内Gemini分析
+		# 使用插件内 Gemini 分析（借用 AstrBot 已配置好的 Provider）
 		try:
-			client = self._get_client()
+			client, model, provider_id = await self._resolve_provider(event)
 		except Exception as e:
-			logger.error(f"[webshot_analyze] 初始化客户端失败: {e}")
-			return "请先在插件配置中填写有效的 Gemini API Key。"
+			logger.error(f"[webshot_analyze] 选取模型提供商 (Provider) 失败: {e}")
+			return str(e)
 
 		try:
 			image_part = self._make_image_part(image_bytes, mime)
@@ -181,7 +196,6 @@ class Main(star.Star):
 					parts=[image_part, types.Part.from_text(text=prompt)],
 				)
 			]
-			model = self.config.get("model", "gemini-2.0-flash")
 			resp = await client.models.generate_content(
 				model=model,
 				contents=contents,
@@ -189,8 +203,8 @@ class Main(star.Star):
 			text = getattr(resp, "text", None) or self._extract_text(resp)
 			return text.strip() if text else "未从分析中获得可用文本结果。"
 		except Exception as e:
-			logger.error(f"[webshot_analyze] 调用失败: {e}")
-			return f"分析失败：{e}"
+			logger.error(f"[webshot_analyze] 调用 Provider「{provider_id}」失败: {e}")
+			return f"分析失败（Provider: {provider_id}）：{e}"
 
 	@llm_tool("webshot_send")
 	async def webshot_send(self, event: AstrMessageEvent, url: str) -> str:
@@ -210,10 +224,10 @@ class Main(star.Star):
 		should_moderate = bool(self.config.get("moderation_before_image_send", False))
 		if should_moderate:
 			try:
-				client = self._get_client()
+				client, model, provider_id = await self._resolve_provider(event)
 			except Exception as e:
-				logger.error(f"[webshot_send] 初始化客户端失败: {e}")
-				return "请先在插件配置中填写有效的 Gemini API Key。"
+				logger.error(f"[webshot_send] 选取模型提供商 (Provider) 失败: {e}")
+				return str(e)
 			try:
 				image_bytes, mime = await self._fetch_screenshot(shot_urls, fmt)
 				image_part = self._make_image_part(image_bytes, mime)
@@ -225,15 +239,14 @@ class Main(star.Star):
 				contents = [
 					types.Content(role="user", parts=[image_part, types.Part.from_text(text=check_prompt)])
 				]
-				model = self.config.get("model", "gemini-2.0-flash")
 				resp = await client.models.generate_content(model=model, contents=contents)
 				decision = (getattr(resp, "text", "") or self._extract_text(resp) or "").strip().upper()
 				if "BLOCK" in decision and "ALLOW" not in decision:
 					await event.send(MessageChain().message("由于合规审核未通过，图片已被拦截。"))
 					return "图片已拦截（审核结果：BLOCK）。"
 			except Exception as e:
-				logger.error(f"[webshot_send] 审核失败: {e}")
-				return f"审核失败：{e}"
+				logger.error(f"[webshot_send] 使用 Provider「{provider_id}」审核失败: {e}")
+				return f"审核失败（Provider: {provider_id}）：{e}"
 
 		# 发送网络图片 URL（平台适配层会下载或转发）
 		# 注意：这里发送的是第一个服务的URL，实际下载会自动轮换
@@ -244,34 +257,128 @@ class Main(star.Star):
 			logger.error(f"[webshot_send] 发送失败: {e}")
 			return f"发送失败：{e}"
 
-	def _get_client(self):
-		"""根据配置选择 API Key，并创建/复用异步 client。支持随机或轮询策略。"""
-		keys = self.config.get("api_key", []) or []
-		if not keys:
-			raise RuntimeError("请在插件配置中填写至少一个 Google API Key。")
+	def _get_configured_search_providers(self) -> list[dict]:
+		"""读取插件设置里的 search_providers（template_list），
+		过滤出真正填写了 provider_id 的条目，每项形如：
+		{"provider_id": "gemini-official", "model_override": ""}
+		"""
+		raw = self.config.get("search_providers", []) or []
+		result = []
+		for item in raw:
+			if not isinstance(item, dict):
+				continue
+			pid = str(item.get("provider_id") or "").strip()
+			if pid:
+				result.append(
+					{
+						"provider_id": pid,
+						"model_override": str(item.get("model_override") or "").strip(),
+					}
+				)
+		return result
 
-		use_random = bool(self.config.get("random_api_key_selection", False))
-		if use_random:
-			key = random.choice(keys)
-		else:
-			key = keys[self._rr_index % len(keys)]
-			self._rr_index += 1
+	async def _resolve_provider(self, event: Optional[AstrMessageEvent] = None):
+		"""按配置选取一个模型提供商 (Provider)，返回 (原生 client, 模型名 model, provider_id)。
 
-		if key in self._clients:
-			return self._clients[key]
+		选取策略：
+		1) 若 search_providers 配置了一个或多个条目，按 random_provider_selection
+		   决定随机 (Random) 或轮询 (Round-robin) 选一个；
+		2) 若未配置任何条目，尝试回退为当前会话正在使用的默认 Provider
+		   （通过 Context.get_current_chat_provider_id / get_using_provider）；
+		3) 找到 Provider 后，要求它必须是 Google GenAI / Gemini 类型
+		   （即内部暴露 .client 且带有 .models.generate_content 的 google-genai
+		   AsyncClient），否则说明该 Provider 无法使用 Google Search 原生工具。
+		"""
+		providers = self._get_configured_search_providers()
+		entry: Optional[dict] = None
+		prov = None
+		provider_id: Optional[str] = None
 
-		api_base = self.config.get(
-			"api_base_url", "https://generativelanguage.googleapis.com"
+		if providers:
+			use_random = bool(self.config.get("random_provider_selection", False))
+			if use_random:
+				entry = random.choice(providers)
+			else:
+				entry = providers[self._rr_index % len(providers)]
+				self._rr_index += 1
+			provider_id = entry["provider_id"]
+			getter = getattr(self.context, "get_provider_by_id", None) or getattr(
+				getattr(self.context, "provider_manager", None), "get_provider_by_id", None
+			)
+			prov = await self._call_maybe_async(getter, provider_id=provider_id)
+		elif event is not None:
+			# 未配置任何 Provider：回退使用当前会话的默认模型
+			using_getter = getattr(self.context, "get_using_provider", None)
+			if using_getter is not None:
+				prov = await self._call_maybe_async(using_getter, umo=event.unified_msg_origin)
+			if prov is None:
+				id_getter = getattr(self.context, "get_current_chat_provider_id", None)
+				fallback_id = await self._call_maybe_async(id_getter, umo=event.unified_msg_origin)
+				if fallback_id:
+					getter = getattr(self.context, "get_provider_by_id", None)
+					prov = await self._call_maybe_async(getter, provider_id=fallback_id)
+					provider_id = fallback_id
+			if prov is not None and provider_id is None:
+				provider_id = (
+					getattr(prov, "provider_id", None)
+					or getattr(prov, "id", None)
+					or "(当前会话默认 Provider)"
+				)
+			entry = {"model_override": ""}
+
+		if prov is None:
+			raise RuntimeError(
+				"尚未配置任何搜索用的模型提供商 (Provider)，也无法取得当前会话的默认 Provider。"
+				"请到插件设置的『search_providers』中，选择至少一个已在 AstrBot"
+				"『模型服务 (Providers)』页面配置好的 Google GenAI / Gemini 类型 Provider。"
+			)
+
+		native_client = getattr(prov, "client", None)
+		if native_client is None or not hasattr(native_client, "models"):
+			raise RuntimeError(
+				f"模型提供商 (Provider)「{provider_id}」不是受支持的 Google GenAI / Gemini 类型 Provider，"
+				"无法启用 Google Search 原生工具 (Native Tool) 进行联网搜索。"
+				"请在插件设置的『search_providers』中换成一个 Gemini 类型的 Provider。"
+			)
+
+		model = (
+			(entry or {}).get("model_override")
+			or self._get_provider_model(prov)
+			or self.config.get("fallback_model", "gemini-3.5-flash")
 		)
-		if api_base.endswith("/"):
-			api_base = api_base[:-1]
+		return native_client, model, provider_id
 
-		http_options = types.HttpOptions(
-			base_url=api_base,
-		)
-		client = genai.Client(api_key=key, http_options=http_options).aio
-		self._clients[key] = client
-		return client
+	@staticmethod
+	async def _call_maybe_async(func, **kwargs):
+		"""兼容不同 AstrBot 版本：Context 上取 Provider 的方法可能是同步或异步、
+		也可能只接受位置参数而非关键字参数。"""
+		if func is None:
+			return None
+		try:
+			result = func(**kwargs)
+		except TypeError:
+			try:
+				result = func(*kwargs.values())
+			except Exception:
+				return None
+		if asyncio.iscoroutine(result):
+			result = await result
+		return result
+
+	@staticmethod
+	def _get_provider_model(prov) -> Optional[str]:
+		"""尝试从 Provider 实例上读取其在 AstrBot『模型服务』页面配置好的默认模型名。"""
+		try:
+			cfg = getattr(prov, "provider_config", None)
+			if isinstance(cfg, dict):
+				m = cfg.get("model")
+				if m:
+					return str(m)
+		except Exception:
+			pass
+		# 兜底：部分版本可能直接暴露 model_name 属性
+		m = getattr(prov, "model_name", None)
+		return str(m) if m else None
 
 	def _build_screenshot_urls(self, page_url: str, fmt: str = "webp", width: int = 1920, height: int = 1080) -> list[str]:
 		"""构建所有配置的截图服务 URL 列表。"""

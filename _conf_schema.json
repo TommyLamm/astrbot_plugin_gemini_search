@@ -1,27 +1,42 @@
 {
-    "api_key": {
-        "description": "Gemini API密钥",
-        "type": "list",
-        "hint": "请输入您的 Gemini API 密钥",
-        "default": []
+    "search_providers": {
+        "description": "用于联网搜索 (gemini_search / webshot_analyze / webshot_send 合规审核) 的模型提供商 (Provider) 列表",
+        "type": "template_list",
+        "hint": "请添加至少一个已在 AstrBot『模型服务 (Providers)』页面配置好的 Google GenAI / Gemini 类型 Provider。可添加多个，将依 random_provider_selection 按顺序轮询或随机选用。若留空，将回退使用当前会话正在使用的默认 Provider（若其也是 Gemini 类型）。",
+        "templates": {
+            "gemini_provider": {
+                "name": "Gemini Provider",
+                "hint": "从 AstrBot 已配置的模型提供商中选择一个 Google GenAI / Gemini 类型的 Provider",
+                "display_item": "provider_id",
+                "items": {
+                    "provider_id": {
+                        "description": "模型提供商 (Provider)",
+                        "type": "string",
+                        "_special": "select_provider",
+                        "hint": "若下拉选单未生效，可直接在此手动填写 AstrBot『模型服务』页面显示的 Provider ID",
+                        "default": ""
+                    },
+                    "model_override": {
+                        "description": "模型覆写（可选，Model Override）",
+                        "type": "string",
+                        "hint": "留空则使用该 Provider 在『模型服务』页面配置好的默认模型；如需针对搜索单独指定模型（例如 gemini-3.5-flash），可在此填写。",
+                        "default": ""
+                    }
+                }
+            }
+        }
     },
-    "api_base_url": {
-        "description": "Gemini API基础URL",
-        "type": "string",
-        "hint": "可以填写你的反代地址,默认为官方API基础URL",
-        "default": "https://generativelanguage.googleapis.com"
-    },
-    "model": {
-        "description": "进行搜索的模型,不在可选的可以到插件代码中进行修改",
-        "type": "string",
-        "hint": "选择要使用的搜索模型",
-        "default": "gemini-2.0-flash"
-    },
-    "random_api_key_selection": {
+    "random_provider_selection": {
         "type": "bool",
-        "title": "随机选择API Key",
-        "description": "启用后，将在可用的API Key中随机选择一个进行调用；禁用则按顺序轮询。",
+        "title": "随机选择 Provider",
+        "description": "启用后，将在上方 search_providers 配置的 Provider 中随机选择一个进行调用；禁用则按顺序轮询。",
         "default": false
+    },
+    "fallback_model": {
+        "description": "当从所选 Provider 读取不到默认模型、且未填写 model_override 时使用的兜底模型名",
+        "type": "string",
+        "hint": "一般不需要修改；仅在 AstrBot 版本差异导致读取不到 Provider 预设模型时才会用到",
+        "default": "gemini-3.5-flash"
     },
     "screenshot_api_base": {
         "description": "网页截图服务基础URL列表（支持多个备用服务）",
