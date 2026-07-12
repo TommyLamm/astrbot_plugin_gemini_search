@@ -1,3 +1,4 @@
 google-genai>=0.4.0
 httpx>=0.27.0
 beautifulsoup4>=4.12.0
+astrbot-model-usage @ https://github.com/TommyLamm/astrbot-model-usage/releases/download/v0.1.0/astrbot_model_usage-0.1.0-py3-none-any.whl

@@ -1,5 +1,6 @@
 import random
 import asyncio
+import time
 from typing import Optional
 from urllib.parse import urlencode
 
@@ -11,6 +12,7 @@ from astrbot.core.message.message_event_result import MessageChain
 # Google GenAI SDK：这里只需要 types（用于组装原生 Google Search 工具调用的请求参数），
 # 不再需要 genai.Client——API Key / Base URL 全部改由 AstrBot 的模型提供商 (Provider) 系统管理。
 from google.genai import types
+from astrbot_model_usage import schedule_model_usage
 
 # HTTP & HTML parsing
 try:
@@ -98,7 +100,10 @@ class Main(star.Star):
 		)
 
 		try:
-			resp = await client.models.generate_content(
+			resp = await self._generate_content_with_stats(
+				event=event,
+				client=client,
+				provider_id=provider_id,
 				model=model,
 				contents=prompt,
 				config=config,
@@ -196,7 +201,10 @@ class Main(star.Star):
 					parts=[image_part, types.Part.from_text(text=prompt)],
 				)
 			]
-			resp = await client.models.generate_content(
+			resp = await self._generate_content_with_stats(
+				event=event,
+				client=client,
+				provider_id=provider_id,
 				model=model,
 				contents=contents,
 			)
@@ -239,7 +247,13 @@ class Main(star.Star):
 				contents = [
 					types.Content(role="user", parts=[image_part, types.Part.from_text(text=check_prompt)])
 				]
-				resp = await client.models.generate_content(model=model, contents=contents)
+				resp = await self._generate_content_with_stats(
+					event=event,
+					client=client,
+					provider_id=provider_id,
+					model=model,
+					contents=contents,
+				)
 				decision = (getattr(resp, "text", "") or self._extract_text(resp) or "").strip().upper()
 				if "BLOCK" in decision and "ALLOW" not in decision:
 					await event.send(MessageChain().message("由于合规审核未通过，图片已被拦截。"))
@@ -276,6 +290,54 @@ class Main(star.Star):
 					}
 				)
 		return result
+
+	async def _generate_content_with_stats(
+		self,
+		*,
+		event: AstrMessageEvent,
+		client,
+		provider_id: str,
+		model: str,
+		**kwargs,
+	):
+		"""Call Google GenAI and record exactly one stat for this API attempt."""
+		started_at = time.time()
+		try:
+			response = await client.models.generate_content(model=model, **kwargs)
+		except asyncio.CancelledError:
+			schedule_model_usage(
+				context=self.context,
+				umo=event.unified_msg_origin,
+				provider_id=provider_id,
+				provider_model=model,
+				status="aborted",
+				started_at=started_at,
+				ended_at=time.time(),
+			)
+			raise
+		except Exception:
+			schedule_model_usage(
+				context=self.context,
+				umo=event.unified_msg_origin,
+				provider_id=provider_id,
+				provider_model=model,
+				status="error",
+				started_at=started_at,
+				ended_at=time.time(),
+			)
+			raise
+
+		schedule_model_usage(
+			context=self.context,
+			umo=event.unified_msg_origin,
+			provider_id=provider_id,
+			provider_model=model,
+			response=response,
+			status="completed",
+			started_at=started_at,
+			ended_at=time.time(),
+		)
+		return response
 
 	async def _resolve_provider(self, event: Optional[AstrMessageEvent] = None):
 		"""按配置选取一个模型提供商 (Provider)，返回 (原生 client, 模型名 model, provider_id)。
@@ -319,11 +381,7 @@ class Main(star.Star):
 					prov = await self._call_maybe_async(getter, provider_id=fallback_id)
 					provider_id = fallback_id
 			if prov is not None and provider_id is None:
-				provider_id = (
-					getattr(prov, "provider_id", None)
-					or getattr(prov, "id", None)
-					or "(当前会话默认 Provider)"
-				)
+				provider_id = self._get_provider_id(prov)
 			entry = {"model_override": ""}
 
 		if prov is None:
@@ -379,6 +437,24 @@ class Main(star.Star):
 		# 兜底：部分版本可能直接暴露 model_name 属性
 		m = getattr(prov, "model_name", None)
 		return str(m) if m else None
+
+	@staticmethod
+	def _get_provider_id(prov) -> str:
+		"""Read the configured AstrBot Provider ID used by statistics grouping."""
+		cfg = getattr(prov, "provider_config", None)
+		if isinstance(cfg, dict) and cfg.get("id"):
+			return str(cfg["id"])
+		for attr in ("provider_id", "id"):
+			value = getattr(prov, attr, None)
+			if value:
+				return str(value)
+		try:
+			meta = prov.meta()
+			if getattr(meta, "id", None):
+				return str(meta.id)
+		except Exception:
+			pass
+		return "unknown"
 
 	def _build_screenshot_urls(self, page_url: str, fmt: str = "webp", width: int = 1920, height: int = 1080) -> list[str]:
 		"""构建所有配置的截图服务 URL 列表。"""
