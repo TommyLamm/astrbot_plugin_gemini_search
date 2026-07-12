@@ -14,6 +14,8 @@ from astrbot.core.message.message_event_result import MessageChain
 from google.genai import types
 from astrbot_model_usage import schedule_model_usage
 
+MODEL_USAGE_SOURCE = "gemini_search"
+
 # HTTP & HTML parsing
 try:
 	import httpx
@@ -310,6 +312,7 @@ class Main(star.Star):
 				umo=event.unified_msg_origin,
 				provider_id=provider_id,
 				provider_model=model,
+				source=MODEL_USAGE_SOURCE,
 				status="aborted",
 				started_at=started_at,
 				ended_at=time.time(),
@@ -321,6 +324,7 @@ class Main(star.Star):
 				umo=event.unified_msg_origin,
 				provider_id=provider_id,
 				provider_model=model,
+				source=MODEL_USAGE_SOURCE,
 				status="error",
 				started_at=started_at,
 				ended_at=time.time(),
@@ -332,6 +336,7 @@ class Main(star.Star):
 			umo=event.unified_msg_origin,
 			provider_id=provider_id,
 			provider_model=model,
+			source=MODEL_USAGE_SOURCE,
 			response=response,
 			status="completed",
 			started_at=started_at,

@@ -75,6 +75,7 @@ def test_generate_content_records_completed(monkeypatch):
 	assert len(calls) == 1
 	assert calls[0]["status"] == "completed"
 	assert calls[0]["response"] is response
+	assert calls[0]["source"] == "gemini_search"
 
 
 def test_generate_content_records_error_and_reraises(monkeypatch):
